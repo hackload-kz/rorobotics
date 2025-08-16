@@ -1,0 +1,22 @@
+FROM rust:1.87-slim-bullseye
+
+RUN apt-get update && apt-get install -y \
+    cmake \
+    g++ \
+    pkg-config \
+    libssl-dev \
+    libsasl2-dev \
+    libzstd-dev \
+    liblz4-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN cargo install cargo-watch
+
+WORKDIR /app
+
+# Для development не нужен сложный multi-stage
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+RUN cargo build --release && rm -rf src
+
+CMD ["cargo", "watch", "-x", "run"]

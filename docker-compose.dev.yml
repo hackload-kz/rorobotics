@@ -1,0 +1,16 @@
+version: '3.8'
+services:
+  app:
+    build:
+      dockerfile: Dockerfile.dev
+    volumes:
+      - .:/app
+      - cargo-cache:/usr/local/cargo/registry
+      - target-cache:/app/target
+    environment:
+      - RUST_LOG=ticket_system=debug,tower_http=debug,sqlx=debug
+    command: cargo watch -x run
+
+volumes:
+  cargo-cache:
+  target-cache:
