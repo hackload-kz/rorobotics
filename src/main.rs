@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::task;
 use tower_http::trace::TraceLayer;
-use tracing::{info, error};
+use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use std::time::Duration;
 
@@ -15,6 +15,7 @@ use ticket_system::{
     controllers,
     cache,
     services::payment::PaymentGatewayClient,
+    search_client::SearchClient,
 };
 
 #[tokio::main]
@@ -29,34 +30,31 @@ async fn main() {
 
     info!("Starting Billetter API for Hackathon");
 
-    // Connect to the database
     let db = Database::new(&config.database.url, config.database.pool_size)
         .await
         .expect("Failed to connect to database");
     info!("Database connected");
     
-    // Run migrations
     db.run_migrations()
         .await
         .expect("Failed to run migrations");
 
-    // Connect to Redis
     let redis = RedisClient::new(&config.redis.url)
         .await
         .expect("Failed to connect to Redis");
     info!("Redis connected");
 
-    // Initialize the cache
     let cache = cache::CacheService::new(redis.clone(), db.clone());
     cache.warmup_cache().await;
     info!("Cache warmed up");
 
-    // Create the shared application state
-    let app_state = Arc::new(AppState { db: db.clone(), redis: redis.clone(), cache, config: config.clone() });
-    
-    // --- Start background tasks ---
-    
-    // Task to clean up expired payments every 5 minutes
+    let app_state = Arc::new(AppState {
+        db: db.clone(),
+        redis: redis.clone(),
+        cache, 
+        config: config.clone(),
+        search_client: SearchClient::new(db.pool.clone()),
+    });
     let payment_client = PaymentGatewayClient::from_config(&config.payment, app_state.clone());
     task::spawn(async move {
         loop {
@@ -65,15 +63,15 @@ async fn main() {
         }
     });
 
-    // --- Start the web server ---
+    let search_client = SearchClient::new(db.pool.clone());
+    search_client.initialize()
+        .await
+        .expect("Failed to initialize search client indexes");
 
-    // Create the main router
     let app = Router::new()
         .route("/", get(|| async { "Billetter API v1.0" }))
         .route("/health", get(|| async { "OK" }))
-        // Mount the routes from the controllers module
         .nest("/api", controllers::routes(app_state.clone()))
-        // Pass the application state to the router
         .with_state(app_state.clone())
         .layer(TraceLayer::new_for_http());
 

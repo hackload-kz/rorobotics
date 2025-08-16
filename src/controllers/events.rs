@@ -1,64 +1,89 @@
 use axum::{
     extract::{Query, State},
+    response::IntoResponse,
     routing::get,
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::sync::Arc;
 use crate::AppState;
+use chrono::NaiveDate;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/events", get(get_events))
+        .route("/events", get(search_events))
 }
 
 #[derive(Debug, Deserialize)]
 pub struct EventsQuery {
-    query: Option<String>,
-    date: Option<String>,
+    pub query: Option<String>,
+    pub date: Option<String>,
+    pub page: Option<u32>,
+    pub pageSize: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct EventResponse {
-    id: i64,
-    title: String,
+    pub id: i64,
+    pub title: String,
+    pub description: Option<String>,
+    pub event_type: String,
+    pub datetime_start: chrono::NaiveDateTime,
+    pub provider: String,
 }
 
-// GET /api/events - Список событий с фильтрацией
-async fn get_events(
+pub async fn search_events(
     State(state): State<Arc<AppState>>,
     Query(params): Query<EventsQuery>,
-) -> Json<Vec<EventResponse>> {
-    let events = state.cache.get_events().await;
-    
-    // Фильтруем события
-    let filtered_events: Vec<EventResponse> = events
-        .into_iter()
-        .filter(|event| {
-            // Фильтр по текстовому поиску
-            if let Some(ref query) = params.query {
-                let query_lower = query.to_lowercase();
-                if !event.title.to_lowercase().contains(&query_lower) &&
-                   !event.description.as_ref().unwrap_or(&String::new()).to_lowercase().contains(&query_lower) {
-                    return false;
-                }
-            }
-            
-            // Фильтр по дате (YYYY-MM-DD)
-            if let Some(ref date) = params.date {
-                let event_date = event.datetime_start.format("%Y-%m-%d").to_string();
-                if event_date != *date {
-                    return false;
-                }
-            }
-            
-            true
-        })
-        .map(|event| EventResponse {
-            id: event.id,
-            title: event.title,
-        })
-        .collect();
-    
-    Json(filtered_events)
+) -> impl IntoResponse {
+    let query_val = params.query.unwrap_or_default();
+    let from_date = params.date.and_then(|s| {
+        NaiveDate::parse_from_str(&s, "%Y-%m-%d")
+            .map(|d| d.and_hms_opt(0, 0, 0).unwrap_or_else(|| d.and_hms(0,0,0)))
+            .ok()
+    });
+
+    // Расчет лимита и смещения
+    let page = params.page.unwrap_or(1);
+    let page_size = params.pageSize.unwrap_or(20);
+    let limit = page_size.max(1).min(20) as i64;
+    let offset = ((page.max(1) - 1) * page_size) as i64;
+
+    match state.search_client.search_events(
+        &query_val,
+        limit,
+        offset,
+        None,
+        None,
+        from_date,
+    ).await {
+        Ok(results) => {
+            let events_response: Vec<EventResponse> = results
+                .into_iter()
+                .map(|r| EventResponse {
+                    id: r.id,
+                    title: r.title,
+                    description: r.description,
+                    event_type: r.event_type,
+                    datetime_start: r.datetime_start,
+                    provider: r.provider,
+                })
+                .collect();
+
+            Json(json!({
+                "success": true,
+                "events": events_response,
+                "count": events_response.len()
+            }))
+        },
+        Err(e) => {
+            tracing::error!("Failed to search events: {:?}", e);
+            Json(json!({
+                "success": false,
+                "events": [],
+                "error": "Failed to retrieve events"
+            }))
+        }
+    }
 }
