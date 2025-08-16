@@ -27,10 +27,7 @@ pub struct EventsQuery {
 pub struct EventResponse {
     pub id: i64,
     pub title: String,
-    pub description: Option<String>,
-    pub event_type: String,
     pub datetime_start: chrono::NaiveDateTime,
-    pub provider: String,
 }
 
 pub async fn search_events(
@@ -54,8 +51,6 @@ pub async fn search_events(
         &query_val,
         limit,
         offset,
-        None,
-        None,
         from_date,
     ).await {
         Ok(results) => {
@@ -64,10 +59,7 @@ pub async fn search_events(
                 .map(|r| EventResponse {
                     id: r.id,
                     title: r.title,
-                    description: r.description,
-                    event_type: r.event_type,
                     datetime_start: r.datetime_start,
-                    provider: r.provider,
                 })
                 .collect();
 

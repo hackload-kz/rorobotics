@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use tracing::info;
 
 /// Клиент для полнотекстового поиска через PostgreSQL
@@ -13,11 +13,7 @@ pub struct SearchClient {
 pub struct EventSearchResult {
     pub id: i64,
     pub title: String,
-    pub description: Option<String>,
-    #[sqlx(rename = "type")]
-    pub event_type: String,
     pub datetime_start: chrono::NaiveDateTime,
-    pub provider: String,
     pub rank: Option<f32>,  // Релевантность результата
 }
 
@@ -36,8 +32,6 @@ impl SearchClient {
         query: &str,
         limit: i64,
         offset: i64,
-        event_type: Option<&str>,
-        provider: Option<&str>,
         from_date: Option<chrono::NaiveDateTime>,
     ) -> Result<Vec<EventSearchResult>, sqlx::Error> {
         let search_query_val = Self::prepare_search_query(query);
@@ -53,19 +47,14 @@ impl SearchClient {
             SELECT 
                 id,
                 title,
-                description,
-                type,
                 datetime_start,
-                provider,
                 ts_rank(search_vector, plainto_tsquery('russian', $1)) as rank
             FROM {},
                  plainto_tsquery('russian', $1) as query_ts
             WHERE 
                 (search_vector @@ query_ts OR $1 = '') -- Полнотекстовый поиск опционален, если query пуст
-                AND (type = $4 OR $4 IS NULL) -- Фильтр по типу, игнорируется если $4 NULL
-                AND (provider = $5 OR $5 IS NULL) -- Фильтр по провайдеру, игнорируется если $5 NULL
-                AND (datetime_start >= $6 OR $6 IS NULL) -- Фильтр по дате "от", игнорируется если $6 NULL
-                AND (CASE WHEN $6 IS NULL THEN datetime_start > NOW() ELSE TRUE END) -- По умолчанию будущие события, если date не указан
+                AND (datetime_start >= $4 OR $4 IS NULL) -- Фильтр по дате "от", игнорируется если $6 NULL
+                AND (CASE WHEN $4 IS NULL THEN datetime_start > NOW() ELSE TRUE END) -- По умолчанию будущие события, если date не указан
             ORDER BY 
                 CASE WHEN $1 = '' THEN datetime_start END ASC, -- Сортировка по дате для пустых запросов
                 CASE WHEN $1 != '' THEN ts_rank(search_vector, query_ts) END DESC, -- Сортировка по релевантности для непустых запросов
@@ -77,8 +66,6 @@ impl SearchClient {
             .bind(search_query_val)      // $1: search_query
             .bind(limit)                 // $2: limit (pageSize)
             .bind(offset)                // $3: offset (from page)
-            .bind(event_type)            // $4: event_type (Option<&str>)
-            .bind(provider)              // $5: provider (Option<&str>)
             .bind(from_date)             // $6: from_date (Option<chrono::NaiveDateTime>)
             .fetch_all(&self.pool)
             .await?;
@@ -118,7 +105,7 @@ impl SearchClient {
         let results = sqlx::query_as::<_, EventSearchResult>(
             r#"
             WITH target_event AS (
-                SELECT type, provider, search_vector
+                SELECT search_vector
                 FROM events_archive
                 WHERE id = $1
             )
@@ -126,7 +113,6 @@ impl SearchClient {
                 e.id,
                 e.title,
                 e.description,
-                e.type,
                 e.datetime_start,
                 e.provider,
                 ts_rank(e.search_vector, t.search_vector) as rank
@@ -134,7 +120,6 @@ impl SearchClient {
             WHERE 
                 e.id != $1
                 AND e.datetime_start > NOW()
-                AND (e.type = t.type OR e.provider = t.provider)
             ORDER BY 
                 ts_rank(e.search_vector, t.search_vector) DESC,
                 e.datetime_start ASC
