@@ -17,7 +17,6 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<crate::AppState>> {
         .merge(bookings::routes())
         .layer(from_fn_with_state(state.clone(), require_auth));
 
-
     let public_routes = Router::new()
         .merge(events::routes());
 

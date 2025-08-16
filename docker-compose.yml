@@ -106,7 +106,7 @@ services:
       - "8080:8080"
     environment:
       KAFKA_BROKERS: redpanda:9092
-      KAFKA_SCHEMAREGISTRY_ENABLED: true
+      KAFKA_SCHEMAREGISTRY_ENABLED: "true"
       KAFKA_SCHEMAREGISTRY_URLS: http://redpanda:8081
     networks:
       - ticket_network
