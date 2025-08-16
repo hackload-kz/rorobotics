@@ -33,7 +33,7 @@ async fn booking_belongs_to_user(pool: &sqlx::PgPool, booking_id: i64, user_id: 
         "SELECT EXISTS(SELECT 1 FROM bookings WHERE id = $1 AND user_id = $2)"
     )
     .bind(booking_id)
-    .bind(user_user_id_to_i64(user_id)) // helper below to avoid implicit cast problems
+    .bind(user_user_id_to_i64(user_id))
     .fetch_one(pool)
     .await
 }
@@ -264,7 +264,7 @@ async fn cancel_booking(
 
     // 4) Очистим резервы в Redis pipeline'ом
     {
-        let mut conn = state.redis.conn.clone();
+        //let mut conn = state.redis.conn.clone();
         let mut pipe = redis::pipe();
         for seat_id in &freed {
             pipe.del(format!("seat:{}:reserved", seat_id));

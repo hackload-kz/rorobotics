@@ -9,7 +9,7 @@ pub struct Config {
     pub redis: RedisConfig,
     pub kafka: KafkaConfig,
     pub jwt: JwtConfig,
-    pub external: ExternalServicesConfig,
+    pub payment: PaymentConfig,
     pub circuit_breaker: CircuitBreakerConfig,
     pub features: FeatureFlags,
 }
@@ -54,13 +54,15 @@ pub struct JwtConfig {
     pub expires_in_hours: i64,
 }
 
-// Настройки внешних сервисов
+// Настройки платежного шлюза
 #[derive(Debug, Clone, Deserialize)]
-pub struct ExternalServicesConfig {
-    pub ticket_service_url: String,
-    pub ticket_service_api_key: String,
-    pub payment_service_url: String,
-    pub payment_service_api_key: String,
+pub struct PaymentConfig {
+    pub merchant_id: String,
+    pub merchant_password: String,
+    pub gateway_url: String,
+    pub success_url: String,
+    pub fail_url: String,
+    pub webhook_url: String,
 }
 
 // Настройки Circuit Breaker
@@ -120,15 +122,17 @@ impl Config {
                     .parse()
                     .expect("JWT_EXPIRES_IN_HOURS must be a valid number"),
             },
-            external: ExternalServicesConfig {
-                ticket_service_url: env::var("EXTERNAL_TICKET_SERVICE_URL")
-                    .unwrap_or_else(|_| "https://ticket-provider.api/v1".to_string()),
-                ticket_service_api_key: env::var("EXTERNAL_TICKET_SERVICE_API_KEY")
-                    .unwrap_or_else(|_| "".to_string()),
-                payment_service_url: env::var("EXTERNAL_PAYMENT_SERVICE_URL")
-                    .unwrap_or_else(|_| "https://payment-provider.api/v1".to_string()),
-                payment_service_api_key: env::var("EXTERNAL_PAYMENT_SERVICE_API_KEY")
-                    .unwrap_or_else(|_| "".to_string()),
+            payment: PaymentConfig {
+                merchant_id: env::var("MERCHANT_ID").expect("MERCHANT_ID must be set"),
+                merchant_password: env::var("MERCHANT_PASSWORD").expect("MERCHANT_PASSWORD must be set"),
+                gateway_url: env::var("PAYMENT_GATEWAY_URL")
+                    .unwrap_or_else(|_| "https://gateway.hackload.com/api/v1".to_string()),
+                success_url: env::var("PAYMENT_SUCCESS_URL")
+                    .unwrap_or_else(|_| "https://your-domain.com/payment/success".to_string()),
+                fail_url: env::var("PAYMENT_FAIL_URL")
+                    .unwrap_or_else(|_| "https://your-domain.com/payment/fail".to_string()),
+                webhook_url: env::var("PAYMENT_WEBHOOK_URL")
+                    .unwrap_or_else(|_| "https://your-domain.com/payment/webhook".to_string()),
             },
             circuit_breaker: CircuitBreakerConfig {
                 failure_threshold: env::var("CIRCUIT_BREAKER_FAILURE_THRESHOLD")

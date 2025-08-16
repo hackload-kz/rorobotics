@@ -5,7 +5,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use crate::{models::Event, AppState};
+use crate::AppState;
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -15,7 +15,7 @@ pub fn routes() -> Router<Arc<AppState>> {
 #[derive(Debug, Deserialize)]
 pub struct EventsQuery {
     query: Option<String>,
-    date: Option<String>, // YYYY-MM-DD формат
+    date: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

@@ -1,9 +1,11 @@
 use axum::{routing::get, Router};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::task;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, error};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use std::time::Duration;
 
 use ticket_system::{
     AppState,
@@ -12,6 +14,7 @@ use ticket_system::{
     redis_client::RedisClient,
     controllers,
     cache,
+    services::payment::PaymentGatewayClient,
 };
 
 #[tokio::main]
@@ -26,36 +29,52 @@ async fn main() {
 
     info!("Starting Billetter API for Hackathon");
 
-    // Подключаемся к БД
+    // Connect to the database
     let db = Database::new(&config.database.url, config.database.pool_size)
         .await
         .expect("Failed to connect to database");
     info!("Database connected");
     
-    // Запускаем миграции
+    // Run migrations
     db.run_migrations()
         .await
         .expect("Failed to run migrations");
 
-    // Подключаемся к Redis
+    // Connect to Redis
     let redis = RedisClient::new(&config.redis.url)
         .await
         .expect("Failed to connect to Redis");
     info!("Redis connected");
 
-    // Добавляем:
+    // Initialize the cache
     let cache = cache::CacheService::new(redis.clone(), db.clone());
     cache.warmup_cache().await;
     info!("Cache warmed up");
 
-    let app_state = Arc::new(AppState { db, redis, cache });
+    // Create the shared application state
+    let app_state = Arc::new(AppState { db: db.clone(), redis: redis.clone(), cache, config: config.clone() });
+    
+    // --- Start background tasks ---
+    
+    // Task to clean up expired payments every 5 minutes
+    let payment_client = PaymentGatewayClient::from_config(&config.payment, app_state.clone());
+    task::spawn(async move {
+        loop {
+            payment_client.cleanup_expired_payments().await;
+            tokio::time::sleep(Duration::from_secs(300)).await;
+        }
+    });
 
-    // Создаем роутер
+    // --- Start the web server ---
+
+    // Create the main router
     let app = Router::new()
         .route("/", get(|| async { "Billetter API v1.0" }))
         .route("/health", get(|| async { "OK" }))
-        .nest("/api", controllers::routes())
-        .with_state(app_state)
+        // Mount the routes from the controllers module
+        .nest("/api", controllers::routes(app_state.clone()))
+        // Pass the application state to the router
+        .with_state(app_state.clone())
         .layer(TraceLayer::new_for_http());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.app.port));
