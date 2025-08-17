@@ -5,6 +5,13 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: ticket_system_app
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+      nproc:
+        soft: 32768
+        hard: 32768
     ports:
       - "${PORT:-8000}:8000"
     environment:
@@ -31,6 +38,30 @@ services:
   db:
     image: postgres:16-alpine
     container_name: ticket_system_db
+    command: |
+      postgres
+      -c max_connections=500
+      -c shared_buffers=1GB
+      -c effective_cache_size=3GB
+      -c maintenance_work_mem=256MB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=16MB
+      -c default_statistics_target=100
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c work_mem=8MB
+      -c min_wal_size=1GB
+      -c max_wal_size=4GB
+      -c checkpoint_timeout=15min
+      -c max_wal_senders=10
+      -c wal_level=replica
+      -c hot_standby=on
+      -c wal_log_hints=on
+      -c log_checkpoints=off
+      -c log_connections=off
+      -c log_disconnections=off
+      -c log_lock_waits=on
+      -c log_min_duration_statement=1000
     environment:
       - POSTGRES_USER=${POSTGRES_USER:-ticket_user}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-ticket_password}

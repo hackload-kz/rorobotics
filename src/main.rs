@@ -1,11 +1,8 @@
 use axum::{routing::get, Router};
 use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::task;
-use tower_http::trace::TraceLayer;
+use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use std::time::Duration;
 
 use ticket_system::{
     AppState,
@@ -18,68 +15,40 @@ use ticket_system::{
     search_client::SearchClient,
 };
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 async fn main() {
     dotenvy::dotenv().ok();
     let config = Config::from_env();
-
+    
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new(&config.app.rust_log))
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::EnvFilter::new("info"))
+        .with(tracing_subscriber::fmt::layer().compact())
         .init();
 
-    info!("Starting Billetter API for Hackathon");
+    info!("Starting Billetter API - NO DATABASE MODE");
 
-    let db = Database::new(&config.database.url, config.database.pool_size)
-        .await
-        .expect("Failed to connect to database");
-    info!("Database connected");
-    
-    db.run_migrations()
-        .await
-        .expect("Failed to run migrations");
-
-    let redis = RedisClient::new(&config.redis.url)
-        .await
-        .expect("Failed to connect to Redis");
-    info!("Redis connected");
-
-    let cache = cache::CacheService::new(redis.clone(), db.clone());
-    cache.warmup_cache().await;
-    info!("Cache warmed up");
-
-    let app_state = Arc::new(AppState {
-        db: db.clone(),
-        redis: redis.clone(),
-        cache, 
-        config: config.clone(),
-        search_client: SearchClient::new(db.pool.clone()),
-    });
-    let payment_client = PaymentGatewayClient::from_config(&config.payment, app_state.clone());
-    task::spawn(async move {
-        loop {
-            payment_client.cleanup_expired_payments().await;
-            tokio::time::sleep(Duration::from_secs(300)).await;
-        }
-    });
-
-    let search_client = SearchClient::new(db.pool.clone());
-    search_client.initialize()
-        .await
-        .expect("Failed to initialize search client indexes");
+    let app_state = AppState::new(config.clone()).await.expect("Failed to initialize application state");
 
     let app = Router::new()
-        .route("/", get(|| async { "Billetter API v1.0" }))
-        .route("/health", get(|| async { "OK" }))
+        .route("/", get(root_handler))
         .nest("/api", controllers::routes(app_state.clone()))
-        .with_state(app_state.clone())
-        .layer(TraceLayer::new_for_http());
+        .with_state(app_state.clone());
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.app.port));
-    info!("Server listening on {}", addr);
+    let port = std::env::var("PORT")
+        .unwrap_or_else(|_| "8000".to_string())
+        .parse::<u16>()
+        .unwrap_or(8000);
+    
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    info!("Server listening on http://{}", addr);
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app.into_make_service())
+    let listener = TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app)
         .await
         .unwrap();
+}
+
+// Простейший handler
+async fn root_handler() -> &'static str {
+    "Billetter API v1.0 - NO DB MODE"
 }
