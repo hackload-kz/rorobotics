@@ -102,6 +102,23 @@ impl CacheService {
         reserved_user == Some(user_id)
     }
 
+    /// Получает закешированный результат поиска по ключу.
+    pub async fn get_cached_search(&self, key: &str) -> Result<Option<String>, redis::RedisError> {
+        let mut conn = self.redis.conn.clone();
+        conn.get(key).await
+    }
+
+    /// Сохраняет результат поиска в кеш с указанным TTL (в секундах).
+    pub async fn cache_search_result(
+        &self,
+        key: &str,
+        value: &str,
+        ttl_seconds: u64,
+    ) -> Result<(), redis::RedisError> {
+        let mut conn = self.redis.conn.clone();
+        conn.set_ex(key, value, ttl_seconds).await
+    }
+
     // === Работа с БД ===
     
     async fn load_events_from_db(&self) -> Result<Vec<Event>, sqlx::Error> {
@@ -172,7 +189,6 @@ impl CacheService {
         let mut conn = self.redis.conn.clone();
         let mut pipe = redis::pipe();
 
-        // 1. Собираем все ключи, которые нужно проверить
         for seat in seats.iter() {
             if seat.status == "FREE" {
                 let key = format!("seat:{}:reserved", seat.id);
@@ -180,13 +196,11 @@ impl CacheService {
             }
         }
 
-        // 2. Выполняем все команды за один раз
         let results: Vec<bool> = match pipe.query_async(&mut conn).await {
             Ok(res) => res,
-            Err(_) => return, // Если Redis упал, ничего не делаем
+            Err(_) => return,
         };
 
-        // 3. Обновляем статусы локально
         let mut reserved_iter = results.iter();
         for seat in seats.iter_mut() {
             if seat.status == "FREE" {
@@ -198,5 +212,4 @@ impl CacheService {
             }
         }
     }
-
 }

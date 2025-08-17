@@ -7,11 +7,8 @@ pub struct Config {
     pub app: AppConfig,
     pub database: DatabaseConfig,
     pub redis: RedisConfig,
-    pub kafka: KafkaConfig,
-    pub jwt: JwtConfig,
     pub payment: PaymentConfig,
     pub circuit_breaker: CircuitBreakerConfig,
-    pub features: FeatureFlags,
 }
 
 // Настройки приложения
@@ -40,13 +37,6 @@ pub struct RedisConfig {
     pub pool_size: u32,
 }
 
-// Настройки Kafka
-#[derive(Debug, Clone, Deserialize)]
-pub struct KafkaConfig {
-    pub brokers: String,
-    pub consumer_group_id: String,
-}
-
 // Настройки JWT
 #[derive(Debug, Clone, Deserialize)]
 pub struct JwtConfig {
@@ -70,14 +60,6 @@ pub struct PaymentConfig {
 pub struct CircuitBreakerConfig {
     pub failure_threshold: u32,
     pub timeout_seconds: u64,
-}
-
-// Feature flags для включения/выключения функциональности
-#[derive(Debug, Clone, Deserialize)]
-pub struct FeatureFlags {
-    pub enable_auth: bool,
-    pub enable_rate_limiting: bool,
-    pub enable_analytics: bool,
 }
 
 impl Config {
@@ -110,18 +92,6 @@ impl Config {
                     .parse()
                     .expect("REDIS_POOL_SIZE must be a valid number"),
             },
-            kafka: KafkaConfig {
-                brokers: env::var("KAFKA_BROKERS").expect("KAFKA_BROKERS must be set"),
-                consumer_group_id: env::var("KAFKA_CONSUMER_GROUP_ID")
-                    .unwrap_or_else(|_| "ticket-system".to_string()),
-            },
-            jwt: JwtConfig {
-                secret: env::var("JWT_SECRET").expect("JWT_SECRET must be set"),
-                expires_in_hours: env::var("JWT_EXPIRES_IN_HOURS")
-                    .unwrap_or_else(|_| "24".to_string())
-                    .parse()
-                    .expect("JWT_EXPIRES_IN_HOURS must be a valid number"),
-            },
             payment: PaymentConfig {
                 merchant_id: env::var("MERCHANT_ID").expect("MERCHANT_ID must be set"),
                 merchant_password: env::var("MERCHANT_PASSWORD").expect("MERCHANT_PASSWORD must be set"),
@@ -143,20 +113,6 @@ impl Config {
                     .unwrap_or_else(|_| "60".to_string())
                     .parse()
                     .expect("CIRCUIT_BREAKER_TIMEOUT_SECONDS must be a valid number"),
-            },
-            features: FeatureFlags {
-                enable_auth: env::var("ENABLE_AUTH")
-                    .unwrap_or_else(|_| "true".to_string())
-                    .parse()
-                    .expect("ENABLE_AUTH must be true or false"),
-                enable_rate_limiting: env::var("ENABLE_RATE_LIMITING")
-                    .unwrap_or_else(|_| "true".to_string())
-                    .parse()
-                    .expect("ENABLE_RATE_LIMITING must be true or false"),
-                enable_analytics: env::var("ENABLE_ANALYTICS")
-                    .unwrap_or_else(|_| "true".to_string())
-                    .parse()
-                    .expect("ENABLE_ANALYTICS must be true or false"),
             },
         }
     }
