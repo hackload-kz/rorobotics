@@ -3,6 +3,9 @@
 dev:
 	docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
 
+dev-daemon:
+	docker-compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+
 dev-build:
 	docker-compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 
