@@ -10,6 +10,7 @@ repository = "https://github.com/yourusername/ticket-system"
 # === Core async runtime ===
 tokio = { version = "1.47", features = ["full"] }
 futures = "0.3"
+mimalloc = "0.1"
 
 # === Web framework ===
 axum = { version = "0.8", features = ["macros", "ws"] }

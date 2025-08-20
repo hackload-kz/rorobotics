@@ -1,3 +1,8 @@
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 use axum::{routing::get, Router};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;

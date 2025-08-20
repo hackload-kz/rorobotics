@@ -24,10 +24,6 @@ services:
         condition: service_healthy
       cache:
         condition: service_healthy
-    volumes:
-      - .:/app
-      - cargo-cache:/usr/local/cargo/registry
-      - target-cache:/app/target
     networks:
       - ticket_network
     restart: unless-stopped
