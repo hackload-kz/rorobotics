@@ -12,6 +12,10 @@ use ticket_system::{
 #[tokio::main(flavor = "multi_thread", worker_threads = 32)]
 async fn main() {
     dotenvy::dotenv().ok();
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new("info"))
+        .with(tracing_subscriber::fmt::layer().compact())
+        .init();
     let config = Config::from_env();
     let app_state = AppState::new(config.clone())
         .await
@@ -26,14 +30,10 @@ async fn main() {
         .unwrap_or(8000);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = TcpListener::bind(addr).await.unwrap();
+    info!("Server listening on http://{}", addr);
     axum::serve(listener, app)
         .await
         .unwrap();
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::new("info"))
-        .with(tracing_subscriber::fmt::layer().compact())
-        .init();
-    info!("Server listening on http://{}", addr);
 }
 
 async fn root_handler() -> &'static str {
