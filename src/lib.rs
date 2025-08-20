@@ -38,17 +38,16 @@ impl AppState {
             search_client,
         });
         
-        // Фоновая инициализация кеша и поиска (не блокирует старт)
-        // let state_for_bg = state.clone();
-        // task::spawn(async move {
-        //     // Warmup cache в фоне
-        //     state_for_bg.cache.warmup_cache().await;
+        let state_for_bg = state.clone();
+        task::spawn(async move {
+            // Warmup cache в фоне
+            state_for_bg.cache.warmup_cache().await;
             
-        //     // Initialize search в фоне
-        //     if let Err(e) = state_for_bg.search_client.initialize().await {
-        //         tracing::error!("Search initialization failed: {:?}", e);
-        //     }
-        // });
+            // Initialize search в фоне
+            if let Err(e) = state_for_bg.search_client.initialize().await {
+                tracing::error!("Search initialization failed: {:?}", e);
+            }
+        });
         
         Ok(state)
     }

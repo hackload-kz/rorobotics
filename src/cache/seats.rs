@@ -1,54 +1,9 @@
-use crate::{database::Database, redis_client::RedisClient};
+use crate::cache::CacheService;
+use crate::models::Seat;
 use redis::AsyncCommands;
 use tracing::info;
-use crate::models::{Event, Seat};
-
-#[derive(Clone)]
-pub struct CacheService {
-    redis: RedisClient,
-    db: Database,
-}
 
 impl CacheService {
-    pub fn new(redis: RedisClient, db: Database) -> Self {
-        Self { redis, db }
-    }
-
-    // Прогрев кеша при старте
-    pub async fn warmup_cache(&self) {
-        info!("Starting cache warmup...");
-        
-        // Загружаем события
-        if let Ok(events) = self.load_events_from_db().await {
-            info!("Loaded {} events", events.len());
-            let _ = self.save_events_to_cache(&events).await;
-        }
-        
-        // Загружаем места для event_id=1
-        if let Ok(seats) = self.load_seats_from_db(1).await {
-            info!("Loaded {} seats", seats.len());
-            let _ = self.save_seats_to_cache(1, &seats).await;
-        }
-        
-        info!("Cache warmup done");
-    }
-
-    // Получить события
-    pub async fn get_events(&self) -> Vec<Event> {
-        // Сначала пробуем кеш
-        if let Ok(events) = self.get_events_from_cache().await {
-            return events;
-        }
-        
-        // Если кеш не работает - идем в БД
-        if let Ok(events) = self.load_events_from_db().await {
-            let _ = self.save_events_to_cache(&events).await;
-            return events;
-        }
-        
-        vec![]
-    }
-
     // Получить места с учетом резервов
     pub async fn get_seats(&self, event_id: i64) -> Vec<Seat> {
         // Сначала пробуем кеш
@@ -102,36 +57,7 @@ impl CacheService {
         reserved_user == Some(user_id)
     }
 
-    /// Получает закешированный результат поиска по ключу.
-    pub async fn get_cached_search(&self, key: &str) -> Result<Option<String>, redis::RedisError> {
-        let mut conn = self.redis.conn.clone();
-        conn.get(key).await
-    }
-
-    /// Сохраняет результат поиска в кеш с указанным TTL (в секундах).
-    pub async fn cache_search_result(
-        &self,
-        key: &str,
-        value: &str,
-        ttl_seconds: u64,
-    ) -> Result<(), redis::RedisError> {
-        let mut conn = self.redis.conn.clone();
-        conn.set_ex(key, value, ttl_seconds).await
-    }
-
     // === Работа с БД ===
-    
-    async fn load_events_from_db(&self) -> Result<Vec<Event>, sqlx::Error> {
-        sqlx::query_as::<_, Event>(
-            "SELECT id, title, description, type as event_type, datetime_start, provider 
-             FROM events_archive 
-             WHERE datetime_start > NOW()
-             ORDER BY datetime_start"
-        )
-        .fetch_all(&self.db.pool)
-        .await
-    }
-
     async fn load_seats_from_db(&self, event_id: i64) -> Result<Vec<Seat>, sqlx::Error> {
         sqlx::query_as::<_, Seat>(
             "SELECT id, event_id, row, number, status, booking_id, category, price::FLOAT as price
@@ -145,24 +71,6 @@ impl CacheService {
     }
 
     // === Работа с кешем ===
-    
-    async fn get_events_from_cache(&self) -> Result<Vec<Event>, redis::RedisError> {
-        let mut conn = self.redis.conn.clone();
-        let data: String = conn.get("events").await?;
-        let events: Vec<Event> = serde_json::from_str(&data).map_err(|_| {
-            redis::RedisError::from((redis::ErrorKind::TypeError, "Parse error"))
-        })?;
-        Ok(events)
-    }
-
-    async fn save_events_to_cache(&self, events: &[Event]) -> Result<(), redis::RedisError> {
-        let data = serde_json::to_string(events).map_err(|_| {
-            redis::RedisError::from((redis::ErrorKind::TypeError, "Serialize error"))
-        })?;
-        let mut conn = self.redis.conn.clone();
-        conn.set_ex("events", data, 3600).await // 1 час
-    }
-
     async fn get_seats_from_cache(&self, event_id: i64) -> Result<Vec<Seat>, redis::RedisError> {
         let mut conn = self.redis.conn.clone();
         let key = format!("seats:{}", event_id);
@@ -182,8 +90,6 @@ impl CacheService {
         conn.set_ex(key, data, 86400).await // 24 часа
     }
 
-    // === Утилиты ===
-    
     // Обновить статусы мест с учетом резервов
     async fn update_seats_with_reservations(&self, seats: &mut [Seat]) {
         let mut conn = self.redis.conn.clone();

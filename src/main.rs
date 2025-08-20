@@ -9,7 +9,7 @@ use ticket_system::{
     controllers,
 };
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 32)]
 async fn main() {
     dotenvy::dotenv().ok();
     let config = Config::from_env();

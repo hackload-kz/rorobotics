@@ -9,6 +9,7 @@ pub struct Config {
     pub redis: RedisConfig,
     pub payment: PaymentConfig,
     pub circuit_breaker: CircuitBreakerConfig,
+    pub cache: CacheConfig,
 }
 
 // Настройки приложения
@@ -62,6 +63,13 @@ pub struct CircuitBreakerConfig {
     pub timeout_seconds: u64,
 }
 
+// Настройки кэша
+#[derive(Debug, Clone, Deserialize)]
+pub struct CacheConfig {
+    pub auth_ttl_seconds: Option<u64>,
+}
+
+
 impl Config {
     pub fn from_env() -> Self {
         Config {
@@ -114,6 +122,11 @@ impl Config {
                     .parse()
                     .expect("CIRCUIT_BREAKER_TIMEOUT_SECONDS must be a valid number"),
             },
+            cache: CacheConfig {
+                auth_ttl_seconds: env::var("CACHE_AUTH_TTL")
+                    .ok()
+                    .and_then(|s| s.parse().ok()),
+            }
         }
     }
 }
