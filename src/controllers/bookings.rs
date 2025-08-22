@@ -209,7 +209,7 @@ async fn cancel_booking(
         .await
         .unwrap_or(false);
     if !belongs {
-        return Err((status_419(), "Бронирование не найдено".to_string()));
+        return Err((StatusCode::FORBIDDEN, "Бронирование не найдено или не принадлежит вам".to_string()));
     }
 
     // заранее получим event_id для инвалидации кеша позже
@@ -443,7 +443,7 @@ async fn release_seat(
     .unwrap_or(false);
 
     if !seat_ok {
-        return Err((status_419(), "Место не найдено или не принадлежит вам".to_string()));
+        return Err((StatusCode::FORBIDDEN, "Место не найдено или не принадлежит вам".to_string()));
     }
 
     let ok = sqlx::query(
