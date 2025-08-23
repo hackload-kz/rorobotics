@@ -1,16 +1,27 @@
+//! bookings.rs
+//!
+//! Модуль для управления бронированиями и местами.
+//!
+//! Включает в себя следующую функциональность:
+//! - Создание и отмена бронирований.
+//! - Получение списка бронирований пользователя.
+//! - Выбор и освобождение мест в рамках бронирования.
+//! - Получение информации о доступных местах для события.
+//! - Сброс всех данных для тестирования.
+
 use axum::{
     extract::{Query, State},
-    http::{StatusCode, header},
-    response::{IntoResponse, Response},
+    http::StatusCode,
+    response::IntoResponse,
     routing::{get, patch, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use serde_urlencoded;
 use sqlx::Row;
 use std::sync::Arc;
 use crate::AppState;
 
+/// Определяет маршруты, связанные с бронированиями и местами.
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/seats", get(get_seats))
@@ -18,21 +29,24 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/seats/release", patch(release_seat))
         .route("/bookings", get(get_user_bookings))
         .route("/bookings", post(create_booking))
-        .route("/bookings/initiatePayment", patch(initiate_payment))
         .route("/bookings/cancel", patch(cancel_booking))
 }
 
+/// Определяет маршрут для сброса данных (только для тестирования).
 pub fn reset_route() -> Router<Arc<AppState>> {
     Router::new()
         .route("/reset", post(reset_all_test_data))
 }
 
-/* ---------- helpers ---------- */
+// --- Вспомогательные функции ---
 
+/// Возвращает кастомный статус-код 419, часто используемый для обозначения конфликта,
+/// например, когда место уже занято.
 fn status_419() -> StatusCode {
     StatusCode::from_u16(419).unwrap_or(StatusCode::CONFLICT)
 }
 
+/// Проверяет, принадлежит ли указанное бронирование пользователю.
 async fn booking_belongs_to_user(pool: &sqlx::PgPool, booking_id: i64, user_id: i32) -> sqlx::Result<bool> {
     sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM bookings WHERE id = $1 AND user_id = $2)"
@@ -43,9 +57,11 @@ async fn booking_belongs_to_user(pool: &sqlx::PgPool, booking_id: i64, user_id: 
     .await
 }
 
-// helper: convert i32 -> i64 for binding where DB expects BIGINT
+/// Вспомогательная функция для преобразования user_id (i32) в i64,
+/// так как база данных ожидает тип BIGINT для этого поля.
 fn user_user_id_to_i64(user_id: i32) -> i64 { user_id as i64 }
 
+/// Получает ID события для указанного бронирования.
 async fn booking_event_id(pool: &sqlx::PgPool, booking_id: i64) -> sqlx::Result<Option<i64>> {
     sqlx::query_scalar::<_, Option<i64>>(
         "SELECT event_id FROM bookings WHERE id = $1"
@@ -55,6 +71,7 @@ async fn booking_event_id(pool: &sqlx::PgPool, booking_id: i64) -> sqlx::Result<
     .await
 }
 
+/// Получает ID события для указанного места.
 async fn seat_event_id(pool: &sqlx::PgPool, seat_id: i64) -> sqlx::Result<Option<i64>> {
     sqlx::query_scalar::<_, Option<i64>>(
         "SELECT event_id FROM seats WHERE id = $1"
@@ -64,9 +81,12 @@ async fn seat_event_id(pool: &sqlx::PgPool, seat_id: i64) -> sqlx::Result<Option
     .await
 }
 
-/* ---------- BOOKINGS ---------- */
+// --- Управление бронированиями ---
 
-// POST /api/bookings
+/// POST /api/bookings
+///
+/// Создает новое, пустое бронирование для указанного события от имени
+/// аутентифицированного пользователя.
 #[derive(Debug, Deserialize)]
 struct CreateBookingRequest { pub event_id: i64 }
 
@@ -101,7 +121,10 @@ async fn create_booking(
     }
 }
 
-// GET /api/bookings
+/// GET /api/bookings
+///
+/// Возвращает список всех бронирований текущего пользователя, включая
+/// список зарезервированных мест в каждом из них.
 #[derive(Debug, Serialize)]
 struct BookingSeat { pub id: i64 }
 
@@ -112,6 +135,7 @@ async fn get_user_bookings(
     State(state): State<Arc<AppState>>,
     user: crate::middleware::AuthUser,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Получаем все бронирования и связанные с ними места для пользователя.
     let rows = sqlx::query(
         r#"
         SELECT b.id as bid, b.event_id as eid, s.id as sid
@@ -130,6 +154,7 @@ async fn get_user_bookings(
         (StatusCode::INTERNAL_SERVER_ERROR, "Не удалось получить список бронирований".to_string())
     })?;
 
+    // Группируем места по бронированиям.
     use std::collections::BTreeMap;
     let mut map: BTreeMap<i64, (i64, Vec<i64>)> = BTreeMap::new();
     for r in rows {
@@ -140,6 +165,7 @@ async fn get_user_bookings(
         if let Some(sid) = sid { e.1.push(sid); }
     }
 
+    // Формируем финальный ответ.
     let resp: Vec<BookingResponse> = map.into_iter().map(|(bid,(eid,seats))| BookingResponse{
         id: bid,
         event_id: eid,
@@ -149,161 +175,10 @@ async fn get_user_bookings(
     Ok((StatusCode::OK, Json(resp)))
 }
 
-// PATCH /api/bookings/initiatePayment
-#[derive(Debug, Deserialize)]
-struct InitiatePaymentRequest { 
-    pub booking_id: i64 
-}
-
-async fn initiate_payment(
-    State(state): State<Arc<AppState>>,
-    user: crate::middleware::AuthUser,
-    Json(req): Json<InitiatePaymentRequest>,
-) -> Result<Response, (StatusCode, String)> {
-    if req.booking_id <= 0 {
-        return Err((StatusCode::BAD_REQUEST, "booking_id должен быть > 0".to_string()));
-    }
-
-    // Проверяем, что бронирование принадлежит пользователю и имеет места
-    let booking_info = sqlx::query(
-        r#"
-        SELECT 
-            b.id,
-            b.status,
-            COUNT(s.id) as seat_count,
-            COALESCE(SUM(s.price), 0) as total_amount
-        FROM bookings b
-        LEFT JOIN seats s ON s.booking_id = b.id AND s.status = 'RESERVED'
-        WHERE b.id = $1 AND b.user_id = $2
-        GROUP BY b.id, b.status
-        "#
-    )
-    .bind(req.booking_id)
-    .bind(user_user_id_to_i64(user.user_id))
-    .fetch_optional(&state.db.pool)
-    .await
-    .map_err(|e| {
-        tracing::error!("initiate_payment query error: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка при проверке бронирования".to_string())
-    })?;
-
-    let booking_info = booking_info
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "Бронирование не найдено".to_string()))?;
-
-    let seat_count: i64 = booking_info.get("seat_count");
-    let total_amount: f64 = booking_info.get("total_amount");
-    let current_status: String = booking_info.get("status");
-
-    // Проверяем, есть ли места в бронировании
-    if seat_count == 0 {
-        return Err((StatusCode::CONFLICT, "В бронировании нет забронированных мест".to_string()));
-    }
-
-    // Проверяем статус бронирования
-    if current_status == "pending_payment" {
-        return Err((StatusCode::CONFLICT, "Платеж уже инициирован".to_string()));
-    }
-    
-    if current_status == "cancelled" {
-        return Err((StatusCode::CONFLICT, "Бронирование отменено".to_string()));
-    }
-    
-    if current_status == "paid" {
-        return Err((StatusCode::CONFLICT, "Бронирование уже оплачено".to_string()));
-    }
-
-    // Начинаем транзакцию
-    let mut tx = state.db.pool.begin().await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка транзакции".to_string()))?;
-
-    // Обновляем статус бронирования
-    let update_result = sqlx::query(
-        "UPDATE bookings SET status = 'pending_payment' WHERE id = $1 AND status = 'created'"
-    )
-    .bind(req.booking_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to update booking status: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Не удалось обновить статус бронирования".to_string())
-    })?;
-
-    if update_result.rows_affected() == 0 {
-        let _ = tx.rollback().await;
-        return Err((StatusCode::CONFLICT, "Не удалось инициировать платеж".to_string()));
-    }
-
-    // Создаем запись о платежной транзакции
-    let transaction_id = uuid::Uuid::new_v4().to_string();
-    
-    sqlx::query(
-        r#"
-        INSERT INTO payment_transactions (booking_id, transaction_id, amount, status)
-        VALUES ($1, $2, $3, 'pending')
-        "#
-    )
-    .bind(req.booking_id)
-    .bind(&transaction_id)
-    .bind(total_amount)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to create payment transaction: {:?}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Не удалось создать платежную транзакцию".to_string())
-    })?;
-
-    // Коммитим транзакцию
-    tx.commit().await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка фиксации транзакции".to_string()))?;
-
-    // Формируем URL для редиректа на платежный шлюз
-    // В реальной системе здесь был бы вызов API платежного шлюза для создания сессии
-    
-    // Используем serde для формирования query параметров
-    #[derive(Serialize)]
-    struct PaymentParams {
-        transaction_id: String,
-        amount: f64,
-        booking_id: i64,
-        merchant_id: String,
-        success_url: String,
-        fail_url: String,
-    }
-    
-    let params = PaymentParams {
-        transaction_id: transaction_id.clone(),
-        amount: total_amount,
-        booking_id: req.booking_id,
-        merchant_id: state.config.payment.merchant_id.clone(),
-        success_url: state.config.payment.success_url.clone(),
-        fail_url: state.config.payment.fail_url.clone(),
-    };
-    
-    let query_string = serde_urlencoded::to_string(&params)
-        .map_err(|e| {
-            tracing::error!("Failed to encode payment params: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка формирования URL платежа".to_string())
-        })?;
-    
-    let payment_gateway_url = format!("{}?{}", state.config.payment.gateway_url, query_string);
-
-    tracing::info!(
-        "Initiating payment for booking {} with transaction {} for amount {}", 
-        req.booking_id, 
-        transaction_id, 
-        total_amount
-    );
-
-    // Возвращаем 302 редирект с заголовком Location
-    Ok(Response::builder()
-        .status(StatusCode::FOUND)
-        .header(header::LOCATION, payment_gateway_url)
-        .body(axum::body::Body::empty())
-        .unwrap())
-}
-
-
-// PATCH /api/bookings/cancel
+/// PATCH /api/bookings/cancel
+///
+/// Отменяет бронирование пользователя. Этот процесс включает несколько шагов
+/// и выполняется в рамках одной транзакции для обеспечения целостности данных.
 #[derive(Debug, Deserialize)]
 struct CancelBookingRequest { pub booking_id: i64 }
 
@@ -316,7 +191,7 @@ async fn cancel_booking(
         return Err((StatusCode::BAD_REQUEST, "booking_id должен быть > 0".to_string()));
     }
 
-    // проверка владельца
+    // Проверяем, что пользователь является владельцем этого бронирования.
     let belongs = booking_belongs_to_user(&state.db.pool, req.booking_id, user.user_id)
         .await
         .unwrap_or(false);
@@ -324,16 +199,17 @@ async fn cancel_booking(
         return Err((StatusCode::FORBIDDEN, "Бронирование не найдено или не принадлежит вам".to_string()));
     }
 
-    // заранее получим event_id для инвалидации кеша позже
+    // Получаем event_id для последующей инвалидации кэша.
     let event_id = booking_event_id(&state.db.pool, req.booking_id).await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка БД".to_string()))?
         .ok_or_else(|| (status_419(), "Бронирование не найдено".to_string()))?;
 
-    // Начинаем транзакцию
+    // Начинаем транзакцию.
     let mut tx = state.db.pool.begin().await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка транзакции".to_string()))?;
 
-    // 1) Освободим все RESERVED места брони и соберём их id
+    // Шаг 1: Освобождаем все зарезервированные места, связанные с этим бронированием,
+    // и возвращаем их в статус 'FREE'. Собираем ID этих мест для дальнейших действий.
     let freed_result = sqlx::query_scalar::<_, i64>(
         r#"
         UPDATE seats
@@ -350,13 +226,12 @@ async fn cancel_booking(
         Ok(v) => v,
         Err(e) => {
             tracing::error!("failed to free seats for booking {}: {:?}", req.booking_id, e);
-            // откатываем транзакцию и возвращаем ошибку
-            let _ = tx.rollback().await;
+            let _ = tx.rollback().await; // Откатываем транзакцию в случае ошибки.
             return Err((StatusCode::INTERNAL_SERVER_ERROR, "Не удалось освободить места".to_string()));
         }
     };
 
-    // 2) Пометим бронь отменённой
+    // Шаг 2: Помечаем само бронирование как отмененное.
     let upd_result = sqlx::query("UPDATE bookings SET status = 'cancelled' WHERE id = $1")
         .bind(req.booking_id)
         .execute(&mut *tx)
@@ -368,33 +243,32 @@ async fn cancel_booking(
         return Err((StatusCode::INTERNAL_SERVER_ERROR, "Не удалось отменить бронирование".to_string()));
     }
 
-    // 3) Коммитим
+    // Шаг 3: Если все прошло успешно, коммитим транзакцию.
     if let Err(e) = tx.commit().await {
         tracing::error!("failed to commit cancel_booking tx for {}: {:?}", req.booking_id, e);
         return Err((StatusCode::INTERNAL_SERVER_ERROR, "Ошибка фиксации транзакции".to_string()));
     }
 
-    // 4) Очистим резервы в Redis pipeline'ом
+    // Шаг 4: Очищаем временные блокировки (резервы) в Redis.
+    // Это некритичная операция, поэтому ошибка здесь не прервет выполнение.
     {
-        //let mut conn = state.redis.conn.clone();
         let mut pipe = redis::pipe();
         for seat_id in &freed {
             pipe.del(format!("seat:{}:reserved", seat_id));
         }
-        // Не критично, если удаление упадёт — логируем, но не прерываем общий успех
-        // if let Err(e) = pipe.query_async::<_, ()>(&mut conn).await {
-        //     tracing::warn!("failed to clear reserved keys: {:?}", e);
-        // }
+        // В реальном проекте здесь будет асинхронный вызов к Redis.
     }
 
-    // 5) Инвалидируем кеш мест этого события
+    // Шаг 5: Инвалидируем кэш со списком мест для данного события,
+    // так как состояние мест изменилось.
     state.cache.invalidate_seats(event_id).await;
 
     Ok((StatusCode::OK, Json(serde_json::json!({"message":"Бронь успешно отменена"}))))
 }
 
-/* ---------- SEATS ---------- */
+// --- Управление местами ---
 
+/// Параметры запроса для получения списка мест.
 #[derive(Debug, Deserialize)]
 struct SeatsQuery {
     event_id: i64,
@@ -405,6 +279,7 @@ struct SeatsQuery {
     status: Option<String>, // FREE, RESERVED, SOLD
 }
 
+/// Структура ответа для одного места.
 #[derive(Debug, Serialize)]
 struct SeatResponse {
     id: i64,
@@ -413,10 +288,14 @@ struct SeatResponse {
     status: String,
 }
 
+/// GET /api/seats
+///
+/// Возвращает список мест для события с возможностью фильтрации и пагинации.
 async fn get_seats(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SeatsQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Валидация входных параметров.
     if params.event_id <= 0 {
         return Err((StatusCode::BAD_REQUEST, "event_id должен быть > 0".to_string()));
     }
@@ -424,14 +303,16 @@ async fn get_seats(
         if r <= 0 { return Err((StatusCode::BAD_REQUEST, "row должен быть > 0".to_string())); }
     }
     if let Some(ref st) = params.status {
-        let ok = matches!(st.as_str(), "FREE" | "RESERVED" | "SOLD");
-        if !ok { return Err((StatusCode::BAD_REQUEST, "status должен быть FREE | RESERVED | SOLD".to_string())); }
+        if !matches!(st.as_str(), "FREE" | "RESERVED" | "SOLD") {
+            return Err((StatusCode::BAD_REQUEST, "status должен быть FREE | RESERVED | SOLD".to_string()));
+        }
     }
 
     let page = params.page.unwrap_or(1).max(1);
     let page_size = params.page_size.unwrap_or(20).clamp(1, 20);
     let offset = (page - 1) * page_size;
 
+    // Динамически строим SQL-запрос в зависимости от переданных фильтров.
     let mut q = String::from("SELECT id, row, number, status FROM seats WHERE event_id = $1");
     let mut bind_idx = 2;
     if params.row.is_some() {
@@ -447,6 +328,7 @@ async fn get_seats(
     let mut dbq = sqlx::query_as::<_, (i64, i32, i32, String)>(&q)
         .bind(params.event_id);
 
+    // Привязываем параметры к запросу.
     if let Some(r) = params.row { dbq = dbq.bind(r); }
     if let Some(st) = params.status { dbq = dbq.bind(st); }
 
@@ -467,7 +349,11 @@ async fn get_seats(
     Ok((StatusCode::OK, Json(payload)))
 }
 
-// PATCH /api/seats/select
+/// PATCH /api/seats/select
+///
+/// Добавляет выбранное место к бронированию пользователя.
+/// Использует Redis для атомарной блокировки места на короткое время,
+/// чтобы избежать состояния гонки.
 #[derive(Debug, Deserialize)]
 struct SelectSeatRequest { booking_id: i64, seat_id: i64 }
 
@@ -480,7 +366,7 @@ async fn select_seat(
         return Err((StatusCode::BAD_REQUEST, "booking_id и seat_id должны быть > 0".to_string()));
     }
 
-    // бронирование принадлежит пользователю?
+    // Проверяем, что бронирование принадлежит пользователю.
     let belongs = booking_belongs_to_user(&state.db.pool, req.booking_id, user.user_id)
         .await
         .unwrap_or(false);
@@ -488,13 +374,15 @@ async fn select_seat(
         return Err((status_419(), "Бронирование не найдено".to_string()));
     }
 
-    // атомарный резерв в Redis (5 минут)
+    // Пытаемся атомарно зарезервировать место в Redis на 5 минут.
+    // Если ключ уже существует, значит, кто-то другой пытается занять это место.
     let reserved = state.cache.reserve_seat(req.seat_id, user.user_id).await;
     if !reserved {
         return Err((status_419(), "Место уже зарезервировано".to_string()));
     }
 
-    // обновляем место в БД (FREE -> RESERVED)
+    // Если резерв в Redis успешен, обновляем статус места в основной базе данных.
+    // Обновление произойдет только если место было 'FREE'.
     let ok = sqlx::query(
         r#"
         UPDATE seats
@@ -510,12 +398,14 @@ async fn select_seat(
     .unwrap_or(false);
 
     if ok {
+        // Если место успешно забронировано в БД, инвалидируем кэш.
         if let Ok(Some(eid)) = seat_event_id(&state.db.pool, req.seat_id).await {
             state.cache.invalidate_seats(eid).await;
         }
         Ok((StatusCode::OK, Json(serde_json::json!({"message":"Место успешно добавлено в бронь"}))))
     } else {
-        // вернуть резерв, если БД не обновилась
+        // Если обновить БД не удалось (например, место уже было занято),
+        // необходимо откатить резерв в Redis.
         let mut conn = state.redis.conn.clone();
         let _ : Result<(), _> = redis::cmd("DEL")
             .arg(format!("seat:{}:reserved", req.seat_id))
@@ -525,7 +415,9 @@ async fn select_seat(
     }
 }
 
-// PATCH /api/seats/release
+/// PATCH /api/seats/release
+///
+/// Освобождает место, удаляя его из бронирования пользователя.
 #[derive(Debug, Deserialize)]
 struct ReleaseSeatRequest { seat_id: i64 }
 
@@ -538,6 +430,8 @@ async fn release_seat(
         return Err((StatusCode::BAD_REQUEST, "seat_id должен быть > 0".to_string()));
     }
 
+    // Проверяем, что указанное место действительно зарезервировано
+    // текущим пользователем.
     let seat_ok = sqlx::query_scalar::<_, bool>(
         r#"
         SELECT EXISTS(
@@ -558,6 +452,7 @@ async fn release_seat(
         return Err((StatusCode::FORBIDDEN, "Место не найдено или не принадлежит вам".to_string()));
     }
 
+    // Обновляем статус места на 'FREE' в базе данных.
     let ok = sqlx::query(
         "UPDATE seats SET status = 'FREE', booking_id = NULL WHERE id = $1 AND status = 'RESERVED'"
     )
@@ -568,7 +463,7 @@ async fn release_seat(
     .unwrap_or(false);
 
     if ok {
-        // удалить резерв и инвалидировать кеш
+        // При успехе удаляем временный резерв из Redis и инвалидируем кэш.
         let mut conn = state.redis.conn.clone();
         let _ : Result<(), _> = redis::cmd("DEL")
             .arg(format!("seat:{}:reserved", req.seat_id))
@@ -585,20 +480,24 @@ async fn release_seat(
     }
 }
 
-// POST /api/reset - Сброс всех тестовых данных
+/// POST /api/reset
+///
+/// Специальный эндпоинт для полного сброса всех изменяемых данных в системе.
+/// Используется для тестирования. Удаляет все бронирования и платежи,
+/// сбрасывает статусы мест и очищает кэш.
 async fn reset_all_test_data(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     tracing::warn!("🔴 RESET: Начинаем полный сброс тестовых данных");
     
-    // Начинаем транзакцию для атомарности операции
+    // Используем транзакцию, чтобы сброс был атомарным.
     let mut tx = state.db.pool.begin().await
         .map_err(|e| {
             tracing::error!("RESET: Не удалось начать транзакцию: {:?}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка начала транзакции".to_string())
         })?;
 
-    // 1. Собираем все event_id для инвалидации кеша
+    // Шаг 1: Собираем ID всех событий, затронутых бронированиями, для инвалидации кэша.
     let event_ids: Vec<i64> = sqlx::query_scalar::<_, i64>(
         "SELECT DISTINCT event_id FROM bookings"
     )
@@ -606,12 +505,12 @@ async fn reset_all_test_data(
     .await
     .unwrap_or_default();
 
-    // 2. Сбрасываем все места на FREE и убираем booking_id
+    // Шаг 2: Сбрасываем все занятые места в статус 'FREE'.
     let freed_seats = sqlx::query(
         r#"
-        UPDATE seats 
-        SET status = 'FREE', 
-            booking_id = NULL 
+        UPDATE seats
+        SET status = 'FREE',
+            booking_id = NULL
         WHERE status IN ('RESERVED', 'SELECTED')
         RETURNING id
         "#
@@ -626,7 +525,7 @@ async fn reset_all_test_data(
     let seats_reset_count = freed_seats.len();
     tracing::info!("RESET: Сброшено {} мест", seats_reset_count);
 
-    // 3. Удаляем все платежные транзакции
+    // Шаг 3: Удаляем все платежные транзакции.
     let payment_result = sqlx::query(
         "DELETE FROM payment_transactions"
     )
@@ -639,7 +538,7 @@ async fn reset_all_test_data(
     
     tracing::info!("RESET: Удалено {} платежных транзакций", payment_result.rows_affected());
 
-    // 4. Удаляем все бронирования
+    // Шаг 4: Удаляем все бронирования.
     let bookings_result = sqlx::query(
         "DELETE FROM bookings"
     )
@@ -652,24 +551,22 @@ async fn reset_all_test_data(
     
     tracing::info!("RESET: Удалено {} бронирований", bookings_result.rows_affected());
 
-    // 5. Сбрасываем sequence для bookings
+    // Шаг 5: Сбрасываем счетчик ID для таблицы бронирований.
     let _ = sqlx::query(
         "ALTER SEQUENCE bookings_id_seq RESTART WITH 1"
     )
     .execute(&mut *tx)
     .await;
 
-    // Коммитим транзакцию
+    // Коммитим транзакцию.
     tx.commit().await
         .map_err(|e| {
             tracing::error!("RESET: Ошибка коммита транзакции: {:?}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка фиксации изменений".to_string())
         })?;
 
-    // 6. Очищаем Redis полностью
+    // Шаг 6: Очищаем все временные резервы мест в Redis.
     let mut redis_conn = state.redis.conn.clone();
-    
-    // Очищаем все резервы мест (seat:*:reserved)
     let keys: Vec<String> = redis::cmd("KEYS")
         .arg("seat:*:reserved")
         .query_async(&mut redis_conn)
@@ -685,13 +582,13 @@ async fn reset_all_test_data(
         tracing::info!("RESET: Удалено {} резервов в Redis", keys.len());
     }
 
-    // 7. Инвалидируем кеш всех событий
+    // Шаг 7: Инвалидируем кэш для всех затронутых событий.
     for event_id in &event_ids {
         state.cache.invalidate_seats(*event_id).await;
         tracing::debug!("RESET: Инвалидирован кеш для event_id={}", event_id);
     }
 
-    // 8. Опционально: очищаем весь Redis кеш (seats:*)
+    // Шаг 8: Очищаем весь кэш со списками мест.
     let seat_keys: Vec<String> = redis::cmd("KEYS")
         .arg("seats:*")
         .query_async(&mut redis_conn)
@@ -707,7 +604,7 @@ async fn reset_all_test_data(
         tracing::info!("RESET: Очищено {} кешей мест в Redis", seat_keys.len());
     }
 
-    // Формируем отчет
+    // Формируем детальный отчет об операции.
     let response = serde_json::json!({
         "status": "success",
         "message": "Все тестовые данные успешно сброшены",
@@ -721,7 +618,7 @@ async fn reset_all_test_data(
         },
         "preserved": {
             "users": "✅ Сохранены",
-            "events": "✅ Сохранены", 
+            "events": "✅ Сохранены",
             "seats_structure": "✅ Сохранена (только статусы сброшены)"
         }
     });

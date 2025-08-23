@@ -48,6 +48,15 @@ impl AppState {
                 tracing::error!("Search initialization failed: {:?}", e);
             }
         });
+
+        // let cleanup_service = crate::services::cleanup::CleanupService::new(state.clone());
+        // task::spawn(async move {
+        //     let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        //     loop {
+        //         interval.tick().await;
+        //         cleanup_service.run_full_cleanup().await;
+        //     }
+        // });
         
         Ok(state)
     }
