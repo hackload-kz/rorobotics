@@ -1,7 +1,6 @@
 use crate::cache::CacheService;
 use crate::models::Event;
 use redis::AsyncCommands;
-use tracing::info;
 
 impl CacheService {
     // Получить события

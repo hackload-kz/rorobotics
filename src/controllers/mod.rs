@@ -1,5 +1,3 @@
-
-
 pub mod test;
 pub mod events;
 pub mod bookings;
@@ -18,7 +16,8 @@ pub fn routes(state: Arc<AppState>) -> Router<Arc<crate::AppState>> {
         .layer(from_fn_with_state(state.clone(), require_auth));
 
     let public_routes = Router::new()
-        .merge(events::routes());
+        .merge(events::routes())
+        .merge(bookings::reset_route());
 
     Router::new()
         .merge(public_routes)

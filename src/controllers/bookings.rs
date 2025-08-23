@@ -8,7 +8,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use std::sync::Arc;
-
 use crate::AppState;
 
 pub fn routes() -> Router<Arc<AppState>> {
@@ -20,6 +19,11 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/bookings", post(create_booking))
         .route("/bookings/initiatePayment", patch(initiate_payment))
         .route("/bookings/cancel", patch(cancel_booking))
+}
+
+pub fn reset_route() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/reset", post(reset_all_test_data))
 }
 
 /* ---------- helpers ---------- */
@@ -471,4 +475,150 @@ async fn release_seat(
     } else {
         Err((status_419(), "Не удалось освободить место".to_string()))
     }
+}
+
+// POST /api/reset - Сброс всех тестовых данных
+async fn reset_all_test_data(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    tracing::warn!("🔴 RESET: Начинаем полный сброс тестовых данных");
+    
+    // Начинаем транзакцию для атомарности операции
+    let mut tx = state.db.pool.begin().await
+        .map_err(|e| {
+            tracing::error!("RESET: Не удалось начать транзакцию: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка начала транзакции".to_string())
+        })?;
+
+    // 1. Собираем все event_id для инвалидации кеша
+    let event_ids: Vec<i64> = sqlx::query_scalar::<_, i64>(
+        "SELECT DISTINCT event_id FROM bookings"
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap_or_default();
+
+    // 2. Сбрасываем все места на FREE и убираем booking_id
+    let freed_seats = sqlx::query(
+        r#"
+        UPDATE seats 
+        SET status = 'FREE', 
+            booking_id = NULL 
+        WHERE status IN ('RESERVED', 'SELECTED')
+        RETURNING id
+        "#
+    )
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("RESET: Ошибка сброса мест: {:?}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка сброса мест".to_string())
+    })?;
+
+    let seats_reset_count = freed_seats.len();
+    tracing::info!("RESET: Сброшено {} мест", seats_reset_count);
+
+    // 3. Удаляем все платежные транзакции
+    let payment_result = sqlx::query(
+        "DELETE FROM payment_transactions"
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("RESET: Ошибка удаления платежей: {:?}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка удаления платежей".to_string())
+    })?;
+    
+    tracing::info!("RESET: Удалено {} платежных транзакций", payment_result.rows_affected());
+
+    // 4. Удаляем все бронирования
+    let bookings_result = sqlx::query(
+        "DELETE FROM bookings"
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("RESET: Ошибка удаления бронирований: {:?}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка удаления бронирований".to_string())
+    })?;
+    
+    tracing::info!("RESET: Удалено {} бронирований", bookings_result.rows_affected());
+
+    // 5. Сбрасываем sequence для bookings
+    let _ = sqlx::query(
+        "ALTER SEQUENCE bookings_id_seq RESTART WITH 1"
+    )
+    .execute(&mut *tx)
+    .await;
+
+    // Коммитим транзакцию
+    tx.commit().await
+        .map_err(|e| {
+            tracing::error!("RESET: Ошибка коммита транзакции: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка фиксации изменений".to_string())
+        })?;
+
+    // 6. Очищаем Redis полностью
+    let mut redis_conn = state.redis.conn.clone();
+    
+    // Очищаем все резервы мест (seat:*:reserved)
+    let keys: Vec<String> = redis::cmd("KEYS")
+        .arg("seat:*:reserved")
+        .query_async(&mut redis_conn)
+        .await
+        .unwrap_or_default();
+    
+    if !keys.is_empty() {
+        let mut pipe = redis::pipe();
+        for key in &keys {
+            pipe.del(key);
+        }
+        let _: Result<(), _> = pipe.query_async(&mut redis_conn).await;
+        tracing::info!("RESET: Удалено {} резервов в Redis", keys.len());
+    }
+
+    // 7. Инвалидируем кеш всех событий
+    for event_id in &event_ids {
+        state.cache.invalidate_seats(*event_id).await;
+        tracing::debug!("RESET: Инвалидирован кеш для event_id={}", event_id);
+    }
+
+    // 8. Опционально: очищаем весь Redis кеш (seats:*)
+    let seat_keys: Vec<String> = redis::cmd("KEYS")
+        .arg("seats:*")
+        .query_async(&mut redis_conn)
+        .await
+        .unwrap_or_default();
+    
+    if !seat_keys.is_empty() {
+        let mut pipe = redis::pipe();
+        for key in &seat_keys {
+            pipe.del(key);
+        }
+        let _: Result<(), _> = pipe.query_async(&mut redis_conn).await;
+        tracing::info!("RESET: Очищено {} кешей мест в Redis", seat_keys.len());
+    }
+
+    // Формируем отчет
+    let response = serde_json::json!({
+        "status": "success",
+        "message": "Все тестовые данные успешно сброшены",
+        "details": {
+            "seats_reset": seats_reset_count,
+            "bookings_deleted": bookings_result.rows_affected(),
+            "payments_deleted": payment_result.rows_affected(),
+            "redis_reserves_cleared": keys.len(),
+            "redis_cache_cleared": seat_keys.len(),
+            "events_invalidated": event_ids.len()
+        },
+        "preserved": {
+            "users": "✅ Сохранены",
+            "events": "✅ Сохранены", 
+            "seats_structure": "✅ Сохранена (только статусы сброшены)"
+        }
+    });
+
+    tracing::warn!("🟢 RESET: Операция завершена успешно");
+    
+    Ok((StatusCode::OK, Json(response)))
 }
