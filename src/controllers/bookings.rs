@@ -1,11 +1,12 @@
 use axum::{
     extract::{Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
     routing::{get, patch, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use serde_urlencoded;
 use sqlx::Row;
 use std::sync::Arc;
 use crate::AppState;
@@ -150,50 +151,157 @@ async fn get_user_bookings(
 
 // PATCH /api/bookings/initiatePayment
 #[derive(Debug, Deserialize)]
-struct InitiatePaymentRequest { pub booking_id: i64 }
+struct InitiatePaymentRequest { 
+    pub booking_id: i64 
+}
 
 async fn initiate_payment(
     State(state): State<Arc<AppState>>,
     user: crate::middleware::AuthUser,
     Json(req): Json<InitiatePaymentRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<Response, (StatusCode, String)> {
     if req.booking_id <= 0 {
         return Err((StatusCode::BAD_REQUEST, "booking_id должен быть > 0".to_string()));
     }
 
-    let has_seats = sqlx::query_scalar::<_, bool>(
+    // Проверяем, что бронирование принадлежит пользователю и имеет места
+    let booking_info = sqlx::query(
         r#"
-        SELECT EXISTS(
-          SELECT 1
-          FROM bookings b
-          JOIN seats s ON s.booking_id = b.id
-          WHERE b.id = $1 AND b.user_id = $2 AND s.status = 'RESERVED'
-        )
+        SELECT 
+            b.id,
+            b.status,
+            COUNT(s.id) as seat_count,
+            COALESCE(SUM(s.price), 0) as total_amount
+        FROM bookings b
+        LEFT JOIN seats s ON s.booking_id = b.id AND s.status = 'RESERVED'
+        WHERE b.id = $1 AND b.user_id = $2
+        GROUP BY b.id, b.status
         "#
     )
     .bind(req.booking_id)
     .bind(user_user_id_to_i64(user.user_id))
-    .fetch_one(&state.db.pool)
+    .fetch_optional(&state.db.pool)
     .await
-    .unwrap_or(false);
+    .map_err(|e| {
+        tracing::error!("initiate_payment query error: {:?}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка при проверке бронирования".to_string())
+    })?;
 
-    if !has_seats {
-        return Err((status_419(), "Бронирование не найдено или в нем нет мест".to_string()));
+    let booking_info = booking_info
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "Бронирование не найдено".to_string()))?;
+
+    let seat_count: i64 = booking_info.get("seat_count");
+    let total_amount: f64 = booking_info.get("total_amount");
+    let current_status: String = booking_info.get("status");
+
+    // Проверяем, есть ли места в бронировании
+    if seat_count == 0 {
+        return Err((StatusCode::CONFLICT, "В бронировании нет забронированных мест".to_string()));
     }
 
-    let ok = sqlx::query("UPDATE bookings SET status = 'pending_payment' WHERE id = $1")
-        .bind(req.booking_id)
-        .execute(&state.db.pool)
-        .await
-        .map(|r| r.rows_affected() > 0)
-        .unwrap_or(false);
-
-    if ok {
-        Ok((StatusCode::OK, Json(serde_json::json!({"message":"Бронь ожидает подтверждения платежа"}))))
-    } else {
-        Err((status_419(), "Не удалось инициировать платеж".to_string()))
+    // Проверяем статус бронирования
+    if current_status == "pending_payment" {
+        return Err((StatusCode::CONFLICT, "Платеж уже инициирован".to_string()));
     }
+    
+    if current_status == "cancelled" {
+        return Err((StatusCode::CONFLICT, "Бронирование отменено".to_string()));
+    }
+    
+    if current_status == "paid" {
+        return Err((StatusCode::CONFLICT, "Бронирование уже оплачено".to_string()));
+    }
+
+    // Начинаем транзакцию
+    let mut tx = state.db.pool.begin().await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка транзакции".to_string()))?;
+
+    // Обновляем статус бронирования
+    let update_result = sqlx::query(
+        "UPDATE bookings SET status = 'pending_payment' WHERE id = $1 AND status = 'created'"
+    )
+    .bind(req.booking_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to update booking status: {:?}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Не удалось обновить статус бронирования".to_string())
+    })?;
+
+    if update_result.rows_affected() == 0 {
+        let _ = tx.rollback().await;
+        return Err((StatusCode::CONFLICT, "Не удалось инициировать платеж".to_string()));
+    }
+
+    // Создаем запись о платежной транзакции
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    
+    sqlx::query(
+        r#"
+        INSERT INTO payment_transactions (booking_id, transaction_id, amount, status)
+        VALUES ($1, $2, $3, 'pending')
+        "#
+    )
+    .bind(req.booking_id)
+    .bind(&transaction_id)
+    .bind(total_amount)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to create payment transaction: {:?}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, "Не удалось создать платежную транзакцию".to_string())
+    })?;
+
+    // Коммитим транзакцию
+    tx.commit().await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка фиксации транзакции".to_string()))?;
+
+    // Формируем URL для редиректа на платежный шлюз
+    // В реальной системе здесь был бы вызов API платежного шлюза для создания сессии
+    
+    // Используем serde для формирования query параметров
+    #[derive(Serialize)]
+    struct PaymentParams {
+        transaction_id: String,
+        amount: f64,
+        booking_id: i64,
+        merchant_id: String,
+        success_url: String,
+        fail_url: String,
+    }
+    
+    let params = PaymentParams {
+        transaction_id: transaction_id.clone(),
+        amount: total_amount,
+        booking_id: req.booking_id,
+        merchant_id: state.config.payment.merchant_id.clone(),
+        success_url: state.config.payment.success_url.clone(),
+        fail_url: state.config.payment.fail_url.clone(),
+    };
+    
+    let query_string = serde_urlencoded::to_string(&params)
+        .map_err(|e| {
+            tracing::error!("Failed to encode payment params: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка формирования URL платежа".to_string())
+        })?;
+    
+    let payment_gateway_url = format!("{}?{}", state.config.payment.gateway_url, query_string);
+
+    tracing::info!(
+        "Initiating payment for booking {} with transaction {} for amount {}", 
+        req.booking_id, 
+        transaction_id, 
+        total_amount
+    );
+
+    // Возвращаем 302 редирект с заголовком Location
+    Ok(Response::builder()
+        .status(StatusCode::FOUND)
+        .header(header::LOCATION, payment_gateway_url)
+        .body(axum::body::Body::empty())
+        .unwrap())
 }
+
 
 // PATCH /api/bookings/cancel
 #[derive(Debug, Deserialize)]

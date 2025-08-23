@@ -7,7 +7,6 @@ use redis::AsyncCommands;
 
 use crate::{
     AppState,
-    redis_client::RedisClient,
     config::PaymentConfig,
 };
 
